@@ -6,6 +6,10 @@ CLI for Apple Silicon ASR on macOS using `mlx-audio`, with:
 - `all` for transcribe-then-rectify in one command
 - `fcpxml` export for Final Cut Pro subtitle import
 
+Default models:
+- transcription: `Qwen/Qwen3-ASR-0.6B`
+- exact subtitle alignment: `Qwen/Qwen3-ForcedAligner-0.6B`
+
 ## Quickstart
 
 ### Install
@@ -66,8 +70,26 @@ profile OpenCLI uses.
 
 Generate transcript output from an input media file.
 
+Default transcription model:
+
+```bash
+Qwen/Qwen3-ASR-0.6B
+```
+
+Default aligner model used for exact SRT/FCPXML subtitle timing when needed:
+
+```bash
+Qwen/Qwen3-ForcedAligner-0.6B
+```
+
 ```bash
 asr-cli transcribe input.mp4 --format srt --max-chars-per-line 24
+```
+
+Override the transcription model with `--model`:
+
+```bash
+asr-cli transcribe input.mp4 --model zai-org/GLM-ASR-Nano-2512 --format srt
 ```
 
 By default, output is written next to the input file. If the target output file
@@ -102,4 +124,10 @@ Run the full flow in one command:
 
 ```bash
 asr-cli all input.mp4 --max-chars-per-line 24 --new-chat
+```
+
+Override the transcription model in the combined flow with `--model`:
+
+```bash
+asr-cli all input.mp4 --model zai-org/GLM-ASR-Nano-2512 --max-chars-per-line 24 --new-chat
 ```
