@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import math
 import shutil
 import re
 import subprocess
@@ -24,7 +26,7 @@ MODEL_ALIASES = {
     "Qwen/Qwen3-ASR-0.6B": "mlx-community/Qwen3-ASR-0.6B-4bit",
 }
 
-FORMAT_CHOICES = ("txt", "json", "srt", "vtt")
+FORMAT_CHOICES = ("txt", "json", "srt", "vtt", "fcpxml")
 FFMPEG_INPUT_SUFFIXES = {
     ".aac",
     ".aiff",
@@ -120,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-chars-per-line",
         type=int,
         default=None,
-        help="Maximum characters per line in SRT output",
+        help="Maximum characters per line in SRT or FCPXML subtitle output",
     )
     transcribe_parser.add_argument(
         "--aligner-model",
@@ -146,14 +148,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     rectify_parser = subparsers.add_parser(
         "rectify",
-        help="Correct wrong subtitle words with Grok while preserving cue timing",
+        help="Correct wrong subtitle words with Gemini while preserving cue timing",
     )
     rectify_parser.add_argument("srt", nargs="+", help="SRT file(s) to correct")
     rectify_parser.add_argument(
         "--wait-seconds",
         type=int,
         default=90,
-        help="Maximum seconds to wait for Grok to return corrected SRT",
+        help="Maximum seconds to wait for Gemini to return corrected SRT",
     )
     rectify_parser.add_argument(
         "--new-chat",
@@ -166,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     all_parser = subparsers.add_parser(
         "all",
-        help="Transcribe with Qwen 0.6B to SRT, then rectify it with Grok",
+        help="Transcribe with Qwen 0.6B to SRT, then rectify it with Gemini",
     )
     all_parser.add_argument("input", help="Input audio or video file")
     all_parser.add_argument(
@@ -190,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-chars-per-line",
         type=int,
         default=None,
-        help="Maximum characters per line in SRT output",
+        help="Maximum characters per line in SRT subtitle output",
     )
     all_parser.add_argument(
         "--aligner-model",
@@ -240,7 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--wait-seconds",
         type=int,
         default=90,
-        help="Maximum seconds to wait for Grok to return corrected SRT",
+        help="Maximum seconds to wait for Gemini to return corrected SRT",
     )
     all_parser.add_argument(
         "--new-chat",
@@ -335,6 +337,17 @@ def format_srt_timestamp(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}".replace(".", ",")
 
 
+def parse_srt_timestamp(value: str) -> float:
+    hours, minutes, rest = value.split(":")
+    seconds, milliseconds = rest.split(",")
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
+
+
 STRONG_BREAK_CHARS = set("。！？!?；;")
 
 
@@ -401,6 +414,94 @@ def render_srt_entries(entries: list[dict[str, str]]) -> str:
             )
         )
     return "\n\n".join(blocks) + "\n"
+
+
+def normalize_caption_language(language: str | None) -> str:
+    if language is None or not language.strip():
+        return "und"
+    cleaned = language.strip().replace("_", "-")
+    if "-" in cleaned:
+        return cleaned
+    simple_map = {
+        "en": "en-US",
+        "zh": "zh-CN",
+        "ja": "ja-JP",
+        "ko": "ko-KR",
+        "fr": "fr-FR",
+        "de": "de-DE",
+        "es": "es-ES",
+    }
+    return simple_map.get(cleaned.lower(), cleaned)
+
+
+def format_fcpxml_time(seconds: float) -> str:
+    milliseconds = max(int(round(seconds * 1000)), 0)
+    if milliseconds == 0:
+        return "0s"
+    denominator = 1000
+    gcd = math.gcd(milliseconds, denominator)
+    numerator = milliseconds // gcd
+    denominator //= gcd
+    if denominator == 1:
+        return f"{numerator}s"
+    return f"{numerator}/{denominator}s"
+
+
+def render_fcpxml_subtitles(
+    entries: list[dict[str, str]],
+    project_name: str,
+    language: str | None,
+) -> str:
+    total_duration = 0.0
+    for entry in entries:
+        end_seconds = parse_srt_timestamp(entry["end"])
+        total_duration = max(total_duration, end_seconds)
+
+    role_language = normalize_caption_language(language)
+    captions: list[str] = []
+    for index, entry in enumerate(entries, start=1):
+        start_seconds = parse_srt_timestamp(entry["start"])
+        end_seconds = parse_srt_timestamp(entry["end"])
+        duration_seconds = max(end_seconds - start_seconds, 0.001)
+        text = html.escape(entry["text"])
+        captions.append(
+            "          "
+            f'<caption name="Subtitle {index}" lane="1" offset="{format_fcpxml_time(start_seconds)}" '
+            f'start="0s" duration="{format_fcpxml_time(duration_seconds)}" '
+            f'role="asr-cli.subtitle?captionFormat=ITT.{role_language}">\n'
+            '            <text placement="bottom">\n'
+            '              <text-style fontFace="Regular" fontColor="1 1 1 1" '
+            f'backgroundColor="0 0 0 0">{text}</text-style>\n'
+            "            </text>\n"
+            "          </caption>"
+        )
+
+    project_name_xml = html.escape(project_name)
+    total_duration_xml = format_fcpxml_time(total_duration if total_duration > 0 else 0.001)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        "<!DOCTYPE fcpxml>\n"
+        '<fcpxml version="1.10">\n'
+        "  <resources>\n"
+        '    <format id="r1" name="FFVideoFormat1080p30" frameDuration="100/3000s" '
+        'width="1920" height="1080" colorSpace="1-1-1 (Rec. 709)"/>\n'
+        "  </resources>\n"
+        "  <library>\n"
+        '    <event name="asr-cli">\n'
+        f'      <project name="{project_name_xml}">\n'
+        f'        <sequence format="r1" duration="{total_duration_xml}" tcStart="0s" '
+        'tcFormat="NDF" audioLayout="stereo" audioRate="48k">\n'
+        "          <spine>\n"
+        f'            <gap name="Subtitles" offset="0s" start="0s" duration="{total_duration_xml}">\n'
+        f'{"\n".join(captions)}\n'
+        "            </gap>\n"
+        "          </spine>\n"
+        "        </sequence>\n"
+        "      </project>\n"
+        "    </event>\n"
+        "  </library>\n"
+        "</fcpxml>\n"
+    )
 
 
 def corrected_srt_path(input_path: Path) -> Path:
@@ -502,7 +603,7 @@ def rectify_file(args: argparse.Namespace) -> int:
         corrected_entries = parse_srt_entries(corrected_raw)
         if len(corrected_entries) != len(original_entries):
             raise SystemExit(
-                "Grok returned a different number of SRT cues; refusing to change timing layout."
+                "Gemini returned a different number of SRT cues; refusing to change timing layout."
             )
 
         merged_entries: list[dict[str, str]] = []
@@ -598,7 +699,7 @@ def align_transcript_words(
 
 def build_srt_cues_from_units(
     units: list[dict[str, float | str]],
-    max_chars_per_line: int,
+    max_chars_per_line: int | None,
 ) -> list[dict[str, float | str]]:
     cues: list[dict[str, float | str]] = []
     current_units: list[dict[str, float | str]] = []
@@ -624,14 +725,22 @@ def build_srt_cues_from_units(
             continue
 
         candidate_text = combine_cue_text(current_text, text)
-        if current_units and visible_length(candidate_text) > max_chars_per_line:
+        if (
+            max_chars_per_line is not None
+            and current_units
+            and visible_length(candidate_text) > max_chars_per_line
+        ):
             flush()
             candidate_text = text
 
         current_units.append(unit)
         current_text = candidate_text
 
-        if visible_length(current_text) >= max_chars_per_line or text[-1] in STRONG_BREAK_CHARS:
+        reached_line_limit = (
+            max_chars_per_line is not None
+            and visible_length(current_text) >= max_chars_per_line
+        )
+        if reached_line_limit or text[-1] in STRONG_BREAK_CHARS:
             flush()
 
     flush()
@@ -660,6 +769,50 @@ def build_exact_srt_cues(
     if not units:
         return []
     return build_srt_cues_from_units(units, max_chars_per_line)
+
+
+def write_fcpxml_subtitles(
+    result: Any,
+    output_prefix: str,
+    load_model: Any,
+    backend_audio: str,
+    max_chars_per_line: int | None,
+    aligner_model_name: str,
+    language: str | None,
+    verbose: bool,
+) -> None:
+    cues = build_exact_srt_cues(
+        result=result,
+        load_model=load_model,
+        backend_audio=backend_audio,
+        max_chars_per_line=max_chars_per_line,
+        aligner_model_name=aligner_model_name,
+        language=language,
+        verbose=verbose,
+    )
+    if not cues:
+        raise SystemExit(
+            "FCPXML subtitle export requested, but no exact caption cues were available."
+        )
+
+    entries = [
+        {
+            "index": str(index),
+            "start": format_srt_timestamp(max(float(cue["start"]), 0.0)),
+            "end": format_srt_timestamp(max(float(cue["end"]), float(cue["start"]) + 0.001)),
+            "text": str(cue["text"]).strip(),
+        }
+        for index, cue in enumerate(cues, start=1)
+    ]
+    output_path = Path(f"{output_prefix}.fcpxml")
+    output_path.write_text(
+        render_fcpxml_subtitles(
+            entries=entries,
+            project_name=output_path.stem,
+            language=language,
+        ),
+        encoding="utf-8",
+    )
 
 
 def rewrite_srt_with_line_limit(
@@ -744,8 +897,9 @@ def transcribe_files(args: argparse.Namespace) -> list[Path]:
     load_model, generate_transcription = load_backend()
     model = load_model(resolved_model)
 
+    backend_format = "srt" if args.format == "fcpxml" else args.format
     base_kwargs: dict[str, Any] = {
-        "format": args.format,
+        "format": backend_format,
         "verbose": args.verbose,
     }
     if args.language is not None:
@@ -802,6 +956,20 @@ def transcribe_files(args: argparse.Namespace) -> list[Path]:
                     language=args.language,
                     verbose=args.verbose,
                 )
+            if args.format == "fcpxml":
+                write_fcpxml_subtitles(
+                    result=result,
+                    output_prefix=output_prefix,
+                    load_model=load_model,
+                    backend_audio=backend_audio,
+                    max_chars_per_line=args.max_chars_per_line,
+                    aligner_model_name=args.aligner_model,
+                    language=args.language,
+                    verbose=args.verbose,
+                )
+                intermediate_srt = Path(f"{output_prefix}.srt")
+                if intermediate_srt.exists():
+                    intermediate_srt.unlink()
         written_paths.append(Path(f"{output_prefix}.{args.format}"))
         if not args.verbose and hasattr(result, "text"):
             print(result.text)
