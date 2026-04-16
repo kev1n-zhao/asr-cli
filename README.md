@@ -6,6 +6,60 @@ CLI for Apple Silicon ASR on macOS using `mlx-audio`, with:
 - `all` for transcribe-then-rectify in one command
 - `fcpxml` export for Final Cut Pro subtitle import
 
+## Quickstart
+
+### Install
+
+Run the macOS installer from the repo root:
+
+```bash
+./install-macos.sh
+```
+
+The installer will:
+- check for Python `>= 3.12`
+- stop and tell you how to install Python first if it is missing
+- create the repo-local `.venv`
+- install `asr-cli` into that `.venv`
+- install a user launcher at `~/.local/bin/asr-cli`
+
+If `~/.local/bin` is not already on your `PATH`, add it:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Full SRT Flow
+
+To run a full transcribe + rectify flow and get SRT output:
+
+```bash
+asr-cli all input.mp4 --max-chars-per-line 24 --new-chat
+```
+
+This will:
+1. transcribe `input.mp4` to an `.srt` next to the input file
+2. send that SRT to Gemini through OpenCLI for correction
+3. write a corrected `.correct.srt` next to the input file
+
+Example output files:
+- `input.srt`
+- `input.correct.srt`
+
+If those files already exist, `asr-cli` adds numeric suffixes instead of
+overwriting them.
+
+### Requirements For `rectify` / `all`
+
+The correction step uses:
+
+```bash
+opencli gemini ask
+```
+
+So you need OpenCLI installed and a working Gemini web session in the browser
+profile OpenCLI uses.
+
 ## Actions
 
 ### `transcribe`
