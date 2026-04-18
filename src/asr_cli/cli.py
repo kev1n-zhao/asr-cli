@@ -9,8 +9,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import warnings
 from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -41,14 +43,30 @@ FFMPEG_INPUT_SUFFIXES = {
     ".webm",
     ".wma",
 }
+OFFICIAL_WHISPER_MODELS = {
+    "tiny",
+    "base",
+    "small",
+    "medium",
+    "large",
+    "turbo",
+    "large-v1",
+    "large-v2",
+    "large-v3",
+}
+OFFICIAL_WHISPER_REPO_TO_MODEL = {
+    "openai/whisper-large-v3-turbo": "turbo",
+    "openai/whisper-large-v3": "large-v3",
+    "openai/whisper-large-v2": "large-v2",
+}
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="asr-cli",
         description=(
-            "ASR on Apple Silicon via MLX. Supports GLM-ASR and Qwen3-ASR "
-            "through mlx-audio-compatible checkpoints."
+            "ASR CLI with official OpenAI Whisper support and MLX backends "
+            "for Qwen3-ASR, GLM-ASR, and related checkpoints."
         ),
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -59,17 +77,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     transcribe_parser.add_argument(
         "--model",
-        default="Qwen/Qwen3-ASR-0.6B",
+        default="openai/whisper-large-v3-turbo",
         help=(
-            "Model alias, official HF repo, MLX-community repo, or local path. "
-            "Examples: Qwen/Qwen3-ASR-0.6B, zai-org/GLM-ASR-Nano-2512, "
-            "mlx-community/Qwen3-ASR-0.6B-4bit."
+            "Official OpenAI Whisper model repo/name, MLX-community repo, or local "
+            "path. Examples: openai/whisper-large-v3-turbo, turbo, "
+            "Qwen/Qwen3-ASR-0.6B, zai-org/GLM-ASR-Nano-2512."
         ),
     )
     transcribe_parser.add_argument(
         "--resolved-model",
         action="store_true",
-        help="Print the MLX model repo/path that will actually be loaded and exit",
+        help="Print the resolved model id that will actually be loaded and exit",
     )
     transcribe_parser.add_argument(
         "--list-models",
@@ -135,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe_parser.add_argument(
         "--stream",
         action="store_true",
-        help="Use streaming generation when supported by the selected model",
+        help="Use streaming generation when supported by the selected backend",
     )
     transcribe_parser.add_argument(
         "--gen-kwargs",
@@ -168,15 +186,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     all_parser = subparsers.add_parser(
         "all",
-        help="Transcribe with Qwen 0.6B to SRT, then rectify it with Gemini",
+        help="Transcribe with Whisper Turbo to SRT, then rectify it with Gemini",
     )
     all_parser.add_argument("input", help="Input audio or video file")
     all_parser.add_argument(
         "--model",
-        default="Qwen/Qwen3-ASR-0.6B",
+        default="openai/whisper-large-v3-turbo",
         help=(
-            "Model alias, official HF repo, MLX-community repo, or local path. "
-            "Defaults to Qwen 0.6B for the combined flow."
+            "Official OpenAI Whisper model repo/name, MLX-community repo, or local "
+            "path. Defaults to OpenAI Whisper Turbo for the combined flow."
         ),
     )
     all_parser.add_argument(
@@ -280,6 +298,7 @@ def print_model_aliases() -> None:
     print("  Qwen/Qwen3-ASR-0.6B -> mlx-community/Qwen3-ASR-0.6B-4bit")
     print("  glm -> mlx-community/GLM-ASR-Nano-2512-4bit")
     print("  zai-org/GLM-ASR-Nano-2512 -> mlx-community/GLM-ASR-Nano-2512-4bit")
+    print("  Official OpenAI Whisper default: openai/whisper-large-v3-turbo")
 
 
 def resolve_output_prefix(audio_path: Path, output_arg: str, multiple_inputs: bool) -> str:
@@ -318,11 +337,146 @@ def uniquify_path(path: Path) -> Path:
     return candidate
 
 
+def confirm_overwrite(path: Path) -> bool:
+    while True:
+        answer = input(f"Output file exists: {path}\nOverwrite? [y/N]: ").strip().lower()
+        if answer in {"y", "yes"}:
+            return True
+        if answer in {"", "n", "no"}:
+            return False
+        print("Please answer y or n.", file=sys.stderr)
+
+
+def choose_output_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    if confirm_overwrite(path):
+        return path
+    return uniquify_path(path)
+
+
+def choose_output_prefix(output_prefix: str, output_format: str) -> str:
+    output_path = choose_output_path(Path(output_prefix).with_suffix(f".{output_format}"))
+    return str(output_path.with_suffix(""))
+
+
+def print_run_config(title: str, items: list[tuple[str, Any]]) -> None:
+    print(f"=== {title} ===", file=sys.stderr)
+    for key, value in items:
+        print(f"{key}: {value}", file=sys.stderr)
+    print(file=sys.stderr)
+
+
 def load_backend():
     from mlx_audio.stt.generate import generate_transcription
     from mlx_audio.stt.utils import load_model
 
     return load_model, generate_transcription
+
+
+def is_official_whisper_model(model_name: str) -> bool:
+    lowered = model_name.lower()
+    return lowered in OFFICIAL_WHISPER_MODELS or lowered in OFFICIAL_WHISPER_REPO_TO_MODEL
+
+
+def official_whisper_runtime_model(model_name: str) -> str:
+    lowered = model_name.lower()
+    return OFFICIAL_WHISPER_REPO_TO_MODEL.get(lowered, lowered)
+
+
+def load_official_whisper() -> Any:
+    try:
+        import whisper
+    except ImportError as exc:
+        raise SystemExit(
+            "Official Whisper support requires the openai-whisper package. "
+            "Install it in this environment first."
+        ) from exc
+    return whisper
+
+
+def transcribe_with_official_whisper(
+    whisper_module: Any,
+    model: Any,
+    audio_path: str,
+    args: argparse.Namespace,
+) -> SimpleNamespace:
+    if args.stream:
+        raise SystemExit("--stream is not supported by the official Whisper backend.")
+    if args.frame_threshold is not None:
+        raise SystemExit("--frame-threshold is not supported by the official Whisper backend.")
+    if args.max_tokens is not None:
+        raise SystemExit("--max-tokens is not supported by the official Whisper backend.")
+    if args.gen_kwargs is not None:
+        raise SystemExit("--gen-kwargs is not supported by the official Whisper backend.")
+    if args.chunk_duration is not None:
+        raise SystemExit("--chunk-duration is not supported by the official Whisper backend.")
+
+    transcribe_kwargs: dict[str, Any] = {
+        "verbose": args.verbose,
+        "word_timestamps": args.format in {"srt", "vtt", "fcpxml"}
+        or args.max_chars_per_line is not None,
+    }
+    if args.language is not None:
+        transcribe_kwargs["language"] = args.language
+    if args.context is not None:
+        transcribe_kwargs["initial_prompt"] = args.context
+    raw_result = model.transcribe(audio_path, **transcribe_kwargs)
+    return SimpleNamespace(
+        text=str(raw_result.get("text", "")).strip(),
+        segments=raw_result.get("segments") or [],
+        language=raw_result.get("language"),
+        raw=raw_result,
+    )
+
+
+def infer_whisper_processor_repo(model_name: str) -> str | None:
+    lowered = model_name.lower()
+    if "whisper-large-v3-turbo" in lowered:
+        return "openai/whisper-large-v3-turbo"
+    if "whisper-large-v3" in lowered:
+        return "openai/whisper-large-v3"
+    if "whisper-large-v2" in lowered:
+        return "openai/whisper-large-v2"
+    if "distil-large-v3" in lowered:
+        return "distil-whisper/distil-large-v3"
+    return None
+
+
+def ensure_whisper_processor(model: Any, model_name: str) -> None:
+    if "whisper" not in model_name.lower():
+        return
+    if getattr(model, "_processor", None) is not None:
+        return
+
+    processor_repo = infer_whisper_processor_repo(model_name)
+    if processor_repo is None:
+        return
+
+    try:
+        from transformers import WhisperProcessor
+
+        model._processor = WhisperProcessor.from_pretrained(processor_repo)
+    except Exception as exc:
+        raise SystemExit(
+            "This Whisper model is missing local processor files, and asr-cli could not "
+            f"load a compatible processor from {processor_repo}: {exc}"
+        ) from exc
+
+
+def load_transcription_model(load_model: Any, model_name: str) -> Any:
+    if "whisper" not in model_name.lower():
+        return load_model(model_name)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Could not load WhisperProcessor: .*",
+            category=UserWarning,
+        )
+        model = load_model(model_name)
+    ensure_whisper_processor(model, model_name)
+    return model
 
 
 SRT_TIMESTAMP_RE = re.compile(
@@ -348,7 +502,18 @@ def parse_srt_timestamp(value: str) -> float:
     )
 
 
-STRONG_BREAK_CHARS = set("。！？!?；;")
+def format_vtt_timestamp(seconds: float) -> str:
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    seconds = seconds % 60
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
+    return f"{minutes:02d}:{seconds:06.3f}"
+
+
+SENTENCE_BREAK_CHARS = {"。", "！", "？", "!", "?", "."}
+ELLIPSIS_BREAK_TAILS = ("...", "…", "……")
+ASCII_WORD_CHAR_RE = re.compile(r"[A-Za-z0-9]")
 
 
 def visible_length(text: str) -> int:
@@ -360,9 +525,18 @@ def combine_cue_text(left: str, right: str) -> str:
         return right
     if not right:
         return left
-    if left[-1].isalnum() and right[0].isalnum():
+    if ASCII_WORD_CHAR_RE.fullmatch(left[-1]) and ASCII_WORD_CHAR_RE.fullmatch(right[0]):
         return f"{left} {right}"
     return f"{left}{right}"
+
+
+def text_has_sentence_break(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.endswith(ELLIPSIS_BREAK_TAILS):
+        return True
+    return stripped[-1] in SENTENCE_BREAK_CHARS
 
 
 def strip_code_fences(text: str) -> str:
@@ -413,6 +587,15 @@ def render_srt_entries(entries: list[dict[str, str]]) -> str:
                 ]
             )
         )
+    return "\n\n".join(blocks) + "\n"
+
+
+def render_vtt_entries(entries: list[dict[str, str]]) -> str:
+    blocks = ["WEBVTT"]
+    for entry in entries:
+        start = format_vtt_timestamp(parse_srt_timestamp(entry["start"]))
+        end = format_vtt_timestamp(parse_srt_timestamp(entry["end"]))
+        blocks.append(f"{start} --> {end}\n{entry['text']}")
     return "\n\n".join(blocks) + "\n"
 
 
@@ -505,7 +688,7 @@ def render_fcpxml_subtitles(
 
 
 def corrected_srt_path(input_path: Path) -> Path:
-    return uniquify_path(input_path.with_name(f"{input_path.stem}.correct{input_path.suffix}"))
+    return choose_output_path(input_path.with_name(f"{input_path.stem}.correct{input_path.suffix}"))
 
 
 def run_opencli(args: list[str], verbose: bool = False) -> str:
@@ -592,6 +775,18 @@ def rectify_file(args: argparse.Namespace) -> int:
         if srt_path.suffix.lower() != ".srt":
             raise SystemExit(f"Expected an .srt file: {srt_path}")
 
+        output_path = corrected_srt_path(srt_path)
+        print_run_config(
+            "RECTIFY CONFIG",
+            [
+                ("input_srt", srt_path),
+                ("output_srt", output_path),
+                ("wait_seconds", args.wait_seconds),
+                ("new_chat", args.new_chat),
+                ("verbose", args.verbose),
+            ],
+        )
+
         original_text = srt_path.read_text(encoding="utf-8")
         original_entries = parse_srt_entries(original_text)
         corrected_raw = correct_srt_with_gemini(
@@ -617,7 +812,6 @@ def rectify_file(args: argparse.Namespace) -> int:
                 }
             )
 
-        output_path = corrected_srt_path(srt_path)
         output_path.write_text(render_srt_entries(merged_entries), encoding="utf-8")
         print(output_path)
     return 0
@@ -635,7 +829,16 @@ def extract_sentence_tokens(sentence: Any) -> list[dict[str, float | str]]:
         end = getattr(token, "end", None)
         if not text or start is None or end is None:
             continue
-        extracted.append({"start": float(start), "end": float(end), "text": text})
+        extracted.append(
+            {
+                "start": float(start),
+                "end": float(end),
+                "text": text,
+                "sentence_end": False,
+            }
+        )
+    if extracted:
+        extracted[-1]["sentence_end"] = True
     return extracted
 
 
@@ -660,10 +863,37 @@ def extract_precise_timed_units(result: Any) -> list[dict[str, float | str]]:
                     end = word.get("end")
                     if not text or start is None or end is None:
                         continue
-                    units.append({"start": float(start), "end": float(end), "text": text})
+                    units.append(
+                        {
+                            "start": float(start),
+                            "end": float(end),
+                            "text": text,
+                            "sentence_end": text_has_sentence_break(text),
+                        }
+                    )
         return units
 
     return units
+
+
+def build_entries_from_segments(result: Any) -> list[dict[str, str]]:
+    segments = getattr(result, "segments", None) or []
+    entries: list[dict[str, str]] = []
+    for index, segment in enumerate(segments, start=1):
+        start = segment.get("start")
+        end = segment.get("end")
+        text = str(segment.get("text", "")).strip()
+        if start is None or end is None or not text:
+            continue
+        entries.append(
+            {
+                "index": str(index),
+                "start": format_srt_timestamp(max(float(start), 0.0)),
+                "end": format_srt_timestamp(max(float(end), float(start) + 0.001)),
+                "text": text,
+            }
+        )
+    return entries
 
 
 def extract_aligned_units(alignment_result: Any) -> list[dict[str, float | str]]:
@@ -674,7 +904,14 @@ def extract_aligned_units(alignment_result: Any) -> list[dict[str, float | str]]
         end = getattr(item, "end_time", None)
         if not text or start is None or end is None:
             continue
-        extracted.append({"start": float(start), "end": float(end), "text": text})
+        extracted.append(
+            {
+                "start": float(start),
+                "end": float(end),
+                "text": text,
+                "sentence_end": text_has_sentence_break(text),
+            }
+        )
     return extracted
 
 
@@ -740,7 +977,8 @@ def build_srt_cues_from_units(
             max_chars_per_line is not None
             and visible_length(current_text) >= max_chars_per_line
         )
-        if reached_line_limit or text[-1] in STRONG_BREAK_CHARS:
+        reached_sentence_end = bool(unit.get("sentence_end")) or text_has_sentence_break(text)
+        if reached_line_limit or reached_sentence_end:
             flush()
 
     flush()
@@ -749,15 +987,15 @@ def build_srt_cues_from_units(
 
 def build_exact_srt_cues(
     result: Any,
-    load_model: Any,
+    load_model: Any | None,
     backend_audio: str,
-    max_chars_per_line: int,
+    max_chars_per_line: int | None,
     aligner_model_name: str,
     language: str | None,
     verbose: bool,
 ) -> list[dict[str, float | str]]:
     units = extract_precise_timed_units(result)
-    if not units:
+    if not units and load_model is not None:
         units = align_transcript_words(
             load_model=load_model,
             aligner_model_name=aligner_model_name,
@@ -853,6 +1091,92 @@ def rewrite_srt_with_line_limit(
             handle.write(f"{str(cue['text']).strip()}\n\n")
 
 
+def write_basic_transcription_output(
+    result: Any,
+    output_prefix: str,
+    output_format: str,
+    load_model: Any | None,
+    backend_audio: str,
+    max_chars_per_line: int | None,
+    aligner_model_name: str,
+    language: str | None,
+    verbose: bool,
+) -> None:
+    output_path = Path(f"{output_prefix}.{output_format}")
+    if output_format == "txt":
+        output_path.write_text(f"{getattr(result, 'text', '').strip()}\n", encoding="utf-8")
+        return
+    if output_format == "json":
+        payload = getattr(result, "raw", None)
+        if payload is None:
+            payload = {
+                "text": getattr(result, "text", ""),
+                "segments": getattr(result, "segments", []),
+                "language": getattr(result, "language", None),
+            }
+        output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return
+    if output_format == "srt":
+        if max_chars_per_line is not None:
+            rewrite_srt_with_line_limit(
+                result=result,
+                output_prefix=output_prefix,
+                load_model=load_model,
+                backend_audio=backend_audio,
+                max_chars_per_line=max_chars_per_line,
+                aligner_model_name=aligner_model_name,
+                language=language,
+                verbose=verbose,
+            )
+            return
+        output_path.write_text(
+            render_srt_entries(build_entries_from_segments(result)),
+            encoding="utf-8",
+        )
+        return
+    if output_format == "vtt":
+        entries = build_entries_from_segments(result)
+        if max_chars_per_line is not None:
+            cues = build_exact_srt_cues(
+                result=result,
+                load_model=load_model,
+                backend_audio=backend_audio,
+                max_chars_per_line=max_chars_per_line,
+                aligner_model_name=aligner_model_name,
+                language=language,
+                verbose=verbose,
+            )
+            entries = [
+                {
+                    "index": str(index),
+                    "start": format_srt_timestamp(max(float(cue["start"]), 0.0)),
+                    "end": format_srt_timestamp(
+                        max(float(cue["end"]), float(cue["start"]) + 0.001)
+                    ),
+                    "text": str(cue["text"]).strip(),
+                }
+                for index, cue in enumerate(cues, start=1)
+            ]
+        output_path.write_text(render_vtt_entries(entries), encoding="utf-8")
+        return
+    if output_format == "fcpxml":
+        write_fcpxml_subtitles(
+            result=result,
+            output_prefix=output_prefix,
+            load_model=load_model,
+            backend_audio=backend_audio,
+            max_chars_per_line=max_chars_per_line,
+            aligner_model_name=aligner_model_name,
+            language=language,
+            verbose=verbose,
+        )
+        return
+    raise SystemExit(f"Unsupported output format: {output_format}")
+
+
 def input_requires_ffmpeg(audio_path: Path) -> bool:
     return audio_path.suffix.lower() in FFMPEG_INPUT_SUFFIXES
 
@@ -894,8 +1218,17 @@ def transcribe_files(args: argparse.Namespace) -> list[Path]:
         raise SystemExit("--max-chars-per-line must be greater than 0")
 
     resolved_model = normalize_model(args.model)
-    load_model, generate_transcription = load_backend()
-    model = load_model(resolved_model)
+    load_model: Any | None = None
+    generate_transcription = None
+    whisper_module = None
+    whisper_runtime_model: str | None = None
+    if is_official_whisper_model(resolved_model):
+        whisper_module = load_official_whisper()
+        whisper_runtime_model = official_whisper_runtime_model(resolved_model)
+        model = whisper_module.load_model(whisper_runtime_model)
+    else:
+        load_model, generate_transcription = load_backend()
+        model = load_transcription_model(load_model, resolved_model)
 
     backend_format = "srt" if args.format == "fcpxml" else args.format
     base_kwargs: dict[str, Any] = {
@@ -923,7 +1256,7 @@ def transcribe_files(args: argparse.Namespace) -> list[Path]:
         if not audio_path.exists():
             raise SystemExit(f"Input file not found: {audio_path}")
 
-        output_prefix = uniquify_output_prefix(
+        output_prefix = choose_output_prefix(
             resolve_output_prefix(audio_path, args.output, multiple_inputs),
             args.format,
         )
@@ -932,44 +1265,78 @@ def transcribe_files(args: argparse.Namespace) -> list[Path]:
             if input_requires_ffmpeg(audio_path):
                 backend_audio = decode_with_ffmpeg(audio_path, stack)
 
-            if args.verbose:
-                print(f"Input: {audio_path}", file=sys.stderr)
-                print(f"Model: {resolved_model}", file=sys.stderr)
-                print(f"Output: {output_prefix}.{args.format}", file=sys.stderr)
-                if backend_audio != str(audio_path):
-                    print("Decode: ffmpeg -> temporary wav", file=sys.stderr)
-
-            result = generate_transcription(
-                model=model,
-                audio=backend_audio,
-                output_path=output_prefix,
-                **base_kwargs,
+            print_run_config(
+                "TRANSCRIBE CONFIG",
+                [
+                    ("input", audio_path),
+                    (
+                        "backend",
+                        "official-openai-whisper"
+                        if whisper_module is not None
+                        else "mlx-audio",
+                    ),
+                    ("model", args.model),
+                    ("resolved_model", resolved_model),
+                    ("backend_model", whisper_runtime_model or resolved_model),
+                    ("output", Path(f"{output_prefix}.{args.format}")),
+                    ("format", args.format),
+                    ("language", args.language),
+                    ("context", args.context),
+                    ("chunk_duration", args.chunk_duration),
+                    ("frame_threshold", args.frame_threshold),
+                    ("max_tokens", args.max_tokens),
+                    ("max_chars_per_line", args.max_chars_per_line),
+                    ("aligner_model", args.aligner_model),
+                    ("stream", args.stream),
+                    ("gen_kwargs", args.gen_kwargs),
+                    ("new_chat", getattr(args, "new_chat", None)),
+                    ("verbose", args.verbose),
+                    ("decoded_with_ffmpeg", backend_audio != str(audio_path)),
+                ],
             )
-            if args.format == "srt" and args.max_chars_per_line is not None:
-                rewrite_srt_with_line_limit(
+
+            if whisper_module is not None:
+                result = transcribe_with_official_whisper(
+                    whisper_module=whisper_module,
+                    model=model,
+                    audio_path=backend_audio,
+                    args=args,
+                )
+                write_basic_transcription_output(
                     result=result,
                     output_prefix=output_prefix,
                     load_model=load_model,
                     backend_audio=backend_audio,
+                    output_format=args.format,
                     max_chars_per_line=args.max_chars_per_line,
                     aligner_model_name=args.aligner_model,
                     language=args.language,
                     verbose=args.verbose,
                 )
-            if args.format == "fcpxml":
-                write_fcpxml_subtitles(
-                    result=result,
-                    output_prefix=output_prefix,
-                    load_model=load_model,
-                    backend_audio=backend_audio,
-                    max_chars_per_line=args.max_chars_per_line,
-                    aligner_model_name=args.aligner_model,
-                    language=args.language,
-                    verbose=args.verbose,
+            else:
+                assert generate_transcription is not None
+                result = generate_transcription(
+                    model=model,
+                    audio=backend_audio,
+                    output_path=output_prefix,
+                    **base_kwargs,
                 )
-                intermediate_srt = Path(f"{output_prefix}.srt")
-                if intermediate_srt.exists():
-                    intermediate_srt.unlink()
+                if args.format in {"txt", "json", "srt", "vtt", "fcpxml"}:
+                    write_basic_transcription_output(
+                        result=result,
+                        output_prefix=output_prefix,
+                        load_model=load_model,
+                        backend_audio=backend_audio,
+                        output_format=args.format,
+                        max_chars_per_line=args.max_chars_per_line,
+                        aligner_model_name=args.aligner_model,
+                        language=args.language,
+                        verbose=args.verbose,
+                    )
+                    if args.format == "fcpxml":
+                        intermediate_srt = Path(f"{output_prefix}.srt")
+                        if intermediate_srt.exists():
+                            intermediate_srt.unlink()
         written_paths.append(Path(f"{output_prefix}.{args.format}"))
         if not args.verbose and hasattr(result, "text"):
             print(result.text)

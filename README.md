@@ -1,14 +1,19 @@
 # asr-cli
 
-CLI for Apple Silicon ASR on macOS using `mlx-audio`, with:
+CLI for local ASR on macOS, with:
+- official `openai-whisper` support for Whisper models
 - `transcribe` for audio/video transcription
 - `rectify` for SRT correction using `opencli gemini ask`
 - `all` for transcribe-then-rectify in one command
 - `fcpxml` export for Final Cut Pro subtitle import
 
 Default models:
-- transcription: `Qwen/Qwen3-ASR-0.6B`
+- transcription: `openai/whisper-large-v3-turbo`
 - exact subtitle alignment: `Qwen/Qwen3-ForcedAligner-0.6B`
+
+Built-in shorthand aliases:
+- `qwen` -> `mlx-community/Qwen3-ASR-0.6B-4bit`
+- `glm` -> `mlx-community/GLM-ASR-Nano-2512-4bit`
 
 ## Quickstart
 
@@ -73,7 +78,7 @@ Generate transcript output from an input media file.
 Default transcription model:
 
 ```bash
-Qwen/Qwen3-ASR-0.6B
+openai/whisper-large-v3-turbo
 ```
 
 Default aligner model used for exact SRT/FCPXML subtitle timing when needed:
@@ -86,11 +91,26 @@ Qwen/Qwen3-ForcedAligner-0.6B
 asr-cli transcribe input.mp4 --format srt --max-chars-per-line 24
 ```
 
+When `--max-chars-per-line` is enabled for `srt` or `fcpxml`, subtitle splitting
+now follows two rules in order:
+- never exceed the configured character limit
+- otherwise prefer sentence-ending semantic boundaries from the backend, with
+  punctuation-based fallback when sentence metadata is unavailable
+
 Override the transcription model with `--model`:
 
 ```bash
 asr-cli transcribe input.mp4 --model zai-org/GLM-ASR-Nano-2512 --format srt
 ```
+
+Use Whisper Turbo:
+
+```bash
+asr-cli transcribe input.mp4 --model openai/whisper-large-v3-turbo --format srt
+```
+
+This uses the official `openai-whisper` Python package and the official
+OpenAI Whisper Turbo model implementation.
 
 By default, output is written next to the input file. If the target output file
 already exists, a numeric suffix is added.
@@ -119,7 +139,7 @@ This action uses `opencli gemini ask`.
 ### `all`
 
 Run the full flow in one command:
-1. transcribe the input file with `Qwen/Qwen3-ASR-0.6B` to SRT
+1. transcribe the input file with `openai/whisper-large-v3-turbo` to SRT
 2. rectify that generated SRT with Gemini
 
 ```bash
@@ -130,4 +150,10 @@ Override the transcription model in the combined flow with `--model`:
 
 ```bash
 asr-cli all input.mp4 --model zai-org/GLM-ASR-Nano-2512 --max-chars-per-line 24 --new-chat
+```
+
+Whisper Turbo also works in the combined flow:
+
+```bash
+asr-cli all input.mp4 --model openai/whisper-large-v3-turbo --max-chars-per-line 24 --new-chat
 ```
